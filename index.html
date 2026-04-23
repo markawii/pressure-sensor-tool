@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>32x32 压力阵列 Web 可视化工具</title>
+    <style>
+        :root { --bg: #1e1e1e; --panel: #2d2d2d; --text: #e0e0e0; --accent: #4CAF50; --danger: #f44336; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); margin: 0; display: flex; height: 100vh; overflow: hidden; }
+        
+        /* 左侧控制面板 */
+        #sidebar { width: 320px; background: var(--panel); padding: 15px; display: flex; flex-direction: column; border-right: 1px solid #444; overflow-y: auto; }
+        h2 { font-size: 1.2rem; margin-top: 0; color: var(--accent); }
+        .group { border: 1px solid #444; padding: 10px; border-radius: 5px; margin-bottom: 15px; }
+        .group-title { font-weight: bold; font-size: 0.9rem; margin-bottom: 10px; display: block; }
+        .row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; font-size: 0.85rem; }
+        
+        select, input, button { background: #3d3d3d; color: white; border: 1px solid #555; padding: 5px; border-radius: 3px; }
+        button { cursor: pointer; border: none; font-weight: bold; }
+        button:hover { opacity: 0.8; }
+        #btn-connect { background: var(--accent); width: 100%; padding: 10px; margin-top: 5px; }
+        #btn-connect.connected { background: var(--danger); }
+
+        /* 右侧显示区 */
+        #main { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; position: relative; }
+        #canvas-container { background: black; box-shadow: 0 0 20px rgba(0,0,0,0.5); position: relative; }
+        canvas { image-rendering: pixelated; cursor: crosshair; }
+        
+        #stats { position: absolute; bottom: 20px; left: 20px; background: rgba(0,0,0,0.6); padding: 10px; border-radius: 5px; font-family: monospace; font-size: 0.8rem; pointer-events: none; }
+        #debug-log { height: 100px; background: #000; color: #0f0; font-family: monospace; font-size: 0.7rem; overflow-y: auto; padding: 5px; margin-top: 10px; }
+    </style>
+</head>
+<body>
+
+<div id="sidebar">
+    <h2>阵列控制台</h2>
+    
+    <div class="group">
+        <span class="group-title">串口设置</span>
+        <div class="row">
+            <label>波特率:</label>
+            <select id="baudrate">
+                <option value="9600">9600</option>
+                <option value="115200" selected>115200</option>
+                <option value="500000">500000</option>
+            </select>
+        </div>
+        <button id="btn-connect">连接传感器</button>
+    </div>
+
+    <div class="group">
+        <span class="group-title">映射校准</span>
+        <div class="row"><label><input type="checkbox" id="flip-v"> 垂直翻转</label></div>
+        <div class="row"><label><input type="checkbox" id="flip-h"> 水平翻转</label></div>
+        <div class="row"><label><input type="checkbox" id="transpose"> 转置(行列交换)</label></div>
+        <div class="row">
+            <label>行偏移:</label>
+            <input type="number" id="off-row" value="0" style="width: 50px;">
+        </div>
+        <div class="row">
+            <label>列偏移:</label>
+            <input type="number" id="off-col" value="0" style="width: 50px;">
+        </div>
+    </div>
+
+    <div class="group">
+        <span class="group-title">显示设置</span>
+        <div class="row"><label><input type="checkbox" id="auto-scale" checked> 自动缩放</label></div>
+        <div class="row">
+            <label>颜色映射:</label>
+            <select id="colormap">
+                <option value="viridis">Viridis (热力)</option>
+                <option value="gray">Gray (灰度)</option>
+            </select>
+        </div>
+    </div>
+
+    <div id="debug-log">等待连接...<br></div>
+</div>
+
+<div id="main">
+    <div id="canvas-container">
+        <canvas id="heatmap" width="32" height="32" style="width: 640px; height: 640px;"></canvas>
+    </div>
+    
+    <div id="stats">
+        FPS: <span id="val-fps">0</span> | 
+        MAX: <span id="val-max">0</span> | 
+        AVG: <span id="val-avg">0</span><br>
+        选中点: <span id="val-point">无</span>
+    </div>
+</div>
+
+<script>
+    // 状态变量
+    let port, reader;
+    let keepReading = false;
+    let rawBuffer = "";
+    let dataQueue = []; // 存储解析出的行数据
+    let lastFrame = Array(32).fill(0).map(() => Array(32).fill(0));
+    
+    const canvas = document.getElementById('heatmap');
+    const ctx = canvas.getContext('2d');
+    const logEl = document.getElementById('debug-log');
+
+    // 伪 Viridis 颜色映射函数
+    function getViridisColor(v) {
+        // v: 0-255
+        const f = v / 255;
+        const r = Math.floor(255 * (0.267 + 0.672 * f));
+        const g = Math.floor(255 * (0.004 + 0.925 * f));
+        const b = Math.floor(255 * (0.329 + 0.117 * f));
+        return [r, g, b];
+    }
+
+    // 矩阵处理逻辑 (对应你的 Numpy 逻辑)
+    function processMatrix(matrix) {
+        let out = JSON.parse(JSON.stringify(matrix)); // 深拷贝
+        
+        // 1. 行列偏移 (Roll)
+        const rowOff = parseInt(document.getElementById('off-row').value) || 0;
+        const colOff = parseInt(document.getElementById('off-col').value) || 0;
+        
+        if(rowOff !== 0) {
+            const shift = (rowOff % 32 + 32) % 32;
+            out = [...out.slice(32-shift), ...out.slice(0, 32-shift)];
+        }
+        if(colOff !== 0) {
+            const shift = (colOff % 32 + 32) % 32;
+            out = out.map(row => [...row.slice(32-shift), ...row.slice(0, 32-shift)]);
+        }
+
+        // 2. 翻转
+        if(document.getElementById('flip-v').checked) out.reverse();
+        if(document.getElementById('flip-h').checked) out.forEach(r => r.reverse());
+
+        // 3. 转置
+        if(document.getElementById('transpose').checked) {
+            out = out[0].map((_, c) => out.map(r => r[c]));
+        }
+
+        return out;
+    }
+
+    // 渲染函数
+    function render(matrix) {
+        const processed = processMatrix(matrix);
+        const imgData = ctx.createImageData(32, 32);
+        
+        let max = 0, sum = 0;
+        const autoScale = document.getElementById('auto-scale').checked;
+        const isGray = document.getElementById('colormap').value === 'gray';
+
+        // 统计
+        processed.forEach(row => row.forEach(v => {
+            if(v > max) max = v;
+            sum += v;
+        }));
+
+        for (let y = 0; y < 32; y++) {
+            for (let x = 0; x < 32; x++) {
+                let val = processed[y][x];
+                let r, g, b;
+                
+                // 模拟自动缩放
+                let norm = autoScale ? (max > 0 ? (val / max) * 255 : 0) : val;
+
+                if(isGray) {
+                    r = g = b = norm;
+                } else {
+                    [r, g, b] = getViridisColor(norm);
+                }
+
+                const idx = (y * 32 + x) * 4;
+                imgData.data[idx] = r;
+                imgData.data[idx+1] = g;
+                imgData.data[idx+2] = b;
+                imgData.data[idx+3] = 255;
+            }
+        }
+        ctx.putImageData(imgData, 0, 0);
+        
+        document.getElementById('val-max').innerText = max;
+        document.getElementById('val-avg').innerText = (sum / 1024).toFixed(1);
+    }
+
+    // 串口读取循环
+    async function readLoop() {
+        const decoder = new TextDecoder();
+        while (port.readable && keepReading) {
+            reader = port.readable.getReader();
+            try {
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    
+                    rawBuffer += decoder.decode(value);
+                    let lines = rawBuffer.split("\n");
+                    rawBuffer = lines.pop(); // 保留不完整的一行
+
+                    for (let line of lines) {
+                        let parts = line.trim().split(/\s+/).map(Number);
+                        if (parts.length === 32) {
+                            dataQueue.push(parts);
+                            if (dataQueue.length === 32) {
+                                lastFrame = [...dataQueue];
+                                render(lastFrame);
+                                dataQueue = [];
+                                updateFPS();
+                            }
+                        }
+                    }
+                }
+            } catch (error) {
+                log("读取错误: " + error);
+            } finally {
+                reader.releaseLock();
+            }
+        }
+    }
+
+    // 交互逻辑
+    document.getElementById('btn-connect').onclick = async () => {
+        if (port) {
+            keepReading = false;
+            await reader.cancel();
+            await port.close();
+            port = null;
+            document.getElementById('btn-connect').innerText = "连接传感器";
+            document.getElementById('btn-connect').classList.remove('connected');
+            return;
+        }
+
+        try {
+            port = await navigator.serial.requestPort();
+            const baud = parseInt(document.getElementById('baudrate').value);
+            await port.open({ baudRate: baud });
+            keepReading = true;
+            document.getElementById('btn-connect').innerText = "断开连接";
+            document.getElementById('btn-connect').classList.add('connected');
+            log("成功连接到串口");
+            readLoop();
+        } catch (err) {
+            log("连接失败: " + err);
+        }
+    };
+
+    // 选中点交互
+    canvas.onmousemove = (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = Math.floor((e.clientX - rect.left) / (rect.width / 32));
+        const y = Math.floor((e.clientY - rect.top) / (rect.height / 32));
+        if(x>=0 && x<32 && y>=0 && y<32) {
+            document.getElementById('val-point').innerText = `(${x}, ${y})`;
+        }
+    };
+
+    // 辅助工具
+    function log(msg) {
+        logEl.innerHTML += msg + "<br>";
+        logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    let frameCount = 0;
+    let lastTime = performance.now();
+    function updateFPS() {
+        frameCount++;
+        let now = performance.now();
+        if (now - lastTime >= 1000) {
+            document.getElementById('val-fps').innerText = frameCount;
+            frameCount = 0;
+            lastTime = now;
+        }
+    }
+</script>
+</body>
+</html>
